@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default catch-all deny rule for active protection
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Validation Blueprint for Students
+    function isValidStudent(data) {
+      return data.keys().hasAll(['id', 'name', 'surname', 'course']) 
+        && data.id is string && data.id.size() <= 128
+        && data.name is string && data.name.size() <= 200
+        && data.surname is string && data.surname.size() <= 200
+        && data.course is string && data.course.size() <= 50;
+    }
+
+    // Validation Blueprint for Attendance
+    function isValidStudentAttendance(data) {
+      return data.keys().hasAll(['id', 'date', 'studentId', 'status', 'observation', 'tags'])
+        && data.id is string && data.id.size() <= 128
+        && data.date is string && data.date.size() <= 20
+        && data.studentId is string && data.studentId.size() <= 128
+        && data.status is string && data.status.size() <= 10
+        && data.observation is string && data.observation.size() <= 2000
+        && data.tags is list && data.tags.size() <= 50;
+    }
+
+    // Students Collection Match Block
+    match /students/{studentId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(studentId) && isValidStudent(incoming());
+      allow update: if isSignedIn() && isValidId(studentId) && isValidStudent(incoming());
+      allow delete: if isSignedIn() && isValidId(studentId);
+    }
+
+    // Attendance Records Collection Match Block
+    match /attendance/{attendanceRecordId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(attendanceRecordId) && isValidStudentAttendance(incoming());
+      allow update: if isSignedIn() && isValidId(attendanceRecordId) && isValidStudentAttendance(incoming());
+      allow delete: if isSignedIn() && isValidId(attendanceRecordId);
+    }
+  }
+}

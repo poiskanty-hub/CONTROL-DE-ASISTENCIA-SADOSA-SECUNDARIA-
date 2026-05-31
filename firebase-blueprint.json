@@ -1,0 +1,82 @@
+{
+  "entities": {
+    "Student": {
+      "title": "Student",
+      "description": "Un estudiante de la Unidad Educativa Santo Domingo Savio, nivel secundario.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identificador único del estudiante."
+        },
+        "name": {
+          "type": "string",
+          "description": "Nombres del estudiante."
+        },
+        "surname": {
+          "type": "string",
+          "description": "Apellidos del estudiante."
+        },
+        "course": {
+          "type": "string",
+          "description": "Curso al que pertenece el estudiante (ej. 1RO A, 2DO B)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Fecha y hora de registro del estudiante."
+        }
+      },
+      "required": ["id", "name", "surname", "course"]
+    },
+    "StudentAttendance": {
+      "title": "StudentAttendance",
+      "description": "Registro de asistencia diario de un estudiante específico.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Identificador en formato {date}__{studentId}."
+        },
+        "date": {
+          "type": "string",
+          "format": "date",
+          "description": "Fecha del registro en formato YYYY-MM-DD."
+        },
+        "studentId": {
+          "type": "string",
+          "description": "Identificador correspondiente de la colección de estudiantes."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["A", "R", "L", "F", ""],
+          "description": "A=Asistencia, R=Retraso, L=Licencia, F=Falta, ''=Sin Marcar."
+        },
+        "observation": {
+          "type": "string",
+          "description": "Comentarios u observaciones escritas o dictadas para el alumno en esa fecha."
+        },
+        "tags": {
+          "type": "array",
+          "description": "Etiquetas de observaciones rápidas seleccionadas de la plantilla predeterminada."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Última fecha de actualización del estado de asistencia."
+        }
+      },
+      "required": ["id", "date", "studentId", "status", "observation", "tags"]
+    }
+  },
+  "firestore": {
+    "/students/{studentId}": {
+      "schema": "Student",
+      "description": "Colección de estudiantes inscritos en el nivel secundario de la institución."
+    },
+    "/attendance/{attendanceRecordId}": {
+      "schema": "StudentAttendance",
+      "description": "Colección de los registros de asistencia de los estudiantes indexada por fecha y estudiante."
+    }
+  }
+}
