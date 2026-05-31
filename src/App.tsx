@@ -43,7 +43,8 @@ import {
   setDoc, 
   deleteDoc, 
   onSnapshot, 
-  getDocFromServer 
+  getDocFromServer,
+  writeBatch
 } from 'firebase/firestore';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from './lib/firebase';
@@ -105,6 +106,21 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   throw new Error(JSON.stringify(errInfo));
 }
 
+const getLocalTodayDateString = () => {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const getFirstOfMonthDateString = () => {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  return `${year}-${month}-01`;
+};
+
 export default function App() {
   // --- AUTH STATES ---
   const [isAuthorized, setIsAuthorized] = useState<boolean>(() => {
@@ -123,13 +139,14 @@ export default function App() {
   const [students, setStudents] = useState<Student[]>(DEFAULT_STUDENTS);
   const [attendance, setAttendance] = useState<AttendanceRecord>({});
   const [selectedCourse, setSelectedCourse] = useState<string>('1RO A');
+  const [selectedPeriod, setSelectedPeriod] = useState<string>('P1');
 
   // --- FIREBASE SYNC & CONNECTION ---
   const [firebaseReady, setFirebaseReady] = useState<boolean>(false);
   const [user, setUser] = useState<any>(null);
 
   // --- DATE & TIME ---
-  const [currentDate, setCurrentDate] = useState<string>('2026-05-29'); // Defaults to time in system metadata
+  const [currentDate, setCurrentDate] = useState<string>(getLocalTodayDateString); // Defaults to current local date
   const [activeTab, setActiveTab] = useState<'diario' | 'estudiantes' | 'reportes'>('diario');
 
   // --- NEW STUDENT STATE ---
@@ -143,10 +160,11 @@ export default function App() {
   // --- VOICE SPEECH TO TEXT STATES ---
   const [listeningStudentId, setListeningStudentId] = useState<string | null>(null);
   const [speechError, setSpeechError] = useState<string | null>(null);
-  const [reportStartDate, setReportStartDate] = useState<string>('2026-05-01');
-  const [reportEndDate, setReportEndDate] = useState<string>('2026-05-29');
+  const [reportStartDate, setReportStartDate] = useState<string>(getFirstOfMonthDateString);
+  const [reportEndDate, setReportEndDate] = useState<string>(getLocalTodayDateString);
   const [reportSearchQuery, setReportSearchQuery] = useState<string>('');
   const [reportCourseFilter, setReportCourseFilter] = useState<string>('Todos');
+  const [reportPeriodFilter, setReportPeriodFilter] = useState<string>('Todos');
 
   // --- FEEDBACK TOAST ---
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
@@ -199,23 +217,52 @@ export default function App() {
       // Sort students alphabetically by surname
       const sorted = studentList.sort((a, b) => a.surname.localeCompare(b.surname, 'es'));
 
-      if (sorted.length > 0) {
+      if (sorted.length >= 750) {
         setStudents(sorted);
       } else {
-        // First initialization seed (We seed first 100, and teacher can trigger full reset from Admin panel)
-        DEFAULT_STUDENTS.slice(0, 150).forEach(async (st) => {
-          try {
-            await setDoc(doc(db, 'students', st.id), {
-              id: st.id,
-              name: st.name,
-              surname: st.surname,
-              course: st.course,
-              createdAt: new Date().toISOString()
-            });
-          } catch (e) {
-            handleFirestoreError(e, OperationType.WRITE, `students/${st.id}`);
-          }
-        });
+        // If Firestore is empty or incomplete (< 750 students),
+        // we merge sorted with DEFAULT_STUDENTS to ensure NO course is left empty in the UI.
+        // Also, we trigger an automatic silent background batch-seed to populate Firestore with all 762 students!
+        const mergedMap = new Map<string, Student>();
+        
+        // Start with default list
+        DEFAULT_STUDENTS.forEach(st => mergedMap.set(st.id, st));
+        // Overwrite/add with Firestore version
+        sorted.forEach(st => mergedMap.set(st.id, st));
+        
+        const mergedList = Array.from(mergedMap.values()).sort((a, b) => a.surname.localeCompare(b.surname, 'es'));
+        setStudents(mergedList);
+
+        // We only trigger auto-seed if we are not already seeding and we are in an empty or very small state (e.g. < 160)
+        if (sorted.length < 160) {
+          const autoBatchSeed = async () => {
+            try {
+              const batchList: Student[][] = [];
+              const size = 300; // writeBatch allows 500 max
+              for (let i = 0; i < DEFAULT_STUDENTS.length; i += size) {
+                batchList.push(DEFAULT_STUDENTS.slice(i, i + size));
+              }
+
+              for (let b = 0; b < batchList.length; b++) {
+                const batch = writeBatch(db);
+                batchList[b].forEach((st) => {
+                  batch.set(doc(db, 'students', st.id), {
+                    id: st.id,
+                    name: st.name,
+                    surname: st.surname,
+                    course: st.course,
+                    createdAt: new Date().toISOString()
+                  });
+                });
+                await batch.commit();
+              }
+              console.log("Automatic initialization completed: All 762 students registered in custom Firestore.");
+            } catch (err) {
+              console.error("Auto seeding error:", err);
+            }
+          };
+          autoBatchSeed();
+        }
       }
     }, (error) => {
       handleFirestoreError(error, OperationType.GET, 'students');
@@ -236,16 +283,24 @@ export default function App() {
         const item = docSnap.data();
         const date = item.date;
         const studentId = item.studentId;
+        const period = item.period || 'P1';
+        const key = `${date}__${period}`;
         
         if (date && studentId) {
-          if (!liveAttendance[date]) {
-            liveAttendance[date] = {};
+          if (!liveAttendance[key]) {
+            liveAttendance[key] = {};
           }
-          liveAttendance[date][studentId] = {
-            status: item.status || '',
-            observation: item.observation || '',
-            tags: item.tags || []
-          };
+          
+          const hasExplicitPeriod = item.period !== undefined;
+          const existingRecord = liveAttendance[key][studentId];
+
+          if (!existingRecord || hasExplicitPeriod) {
+            liveAttendance[key][studentId] = {
+              status: item.status || '',
+              observation: item.observation || '',
+              tags: item.tags || []
+            };
+          }
         }
       });
       
@@ -305,12 +360,14 @@ export default function App() {
   };
 
   // --- CLOUD FIRESTORE REC SAVE HELPER ---
-  const saveAttendanceToFirestore = async (studentId: string, status: AttendanceStatus, observation: string, tags: string[]) => {
-    const docId = `${currentDate}__${studentId}`;
+  const saveAttendanceToFirestore = async (studentId: string, status: AttendanceStatus, observation: string, tags: string[], periodOverride?: string) => {
+    const period = periodOverride || selectedPeriod;
+    const docId = `${currentDate}__${period}__${studentId}`;
     try {
       await setDoc(doc(db, 'attendance', docId), {
         id: docId,
         date: currentDate,
+        period,
         studentId,
         status,
         observation,
@@ -324,11 +381,12 @@ export default function App() {
 
   // --- OPTIMISTIC RECORD SAVE WRAPPER ---
   const saveAttendanceStateOptimistic = (studentId: string, status: AttendanceStatus, observation: string, tags: string[]) => {
+    const activeKey = `${currentDate}__${selectedPeriod}`;
     setAttendance(prev => {
-      const todayRecord = prev[currentDate] || {};
+      const todayRecord = prev[activeKey] || {};
       return {
         ...prev,
-        [currentDate]: {
+        [activeKey]: {
           ...todayRecord,
           [studentId]: {
             status,
@@ -344,7 +402,8 @@ export default function App() {
 
   // --- STUDENT BUBBLE STATE CHANGER ---
   const cycleAttendance = (studentId: string) => {
-    const todayRecord = attendance[currentDate] || {};
+    const activeKey = `${currentDate}__${selectedPeriod}`;
+    const todayRecord = attendance[activeKey] || {};
     const currentStudentRec = todayRecord[studentId] || { status: '', observation: '', tags: [] };
     
     let nextStatus: AttendanceStatus = '';
@@ -361,21 +420,24 @@ export default function App() {
 
   // --- MANUAL ATTENDANCE OVERWRITE WITH BUTTONS IF PREFERRED ---
   const setSpecificStatus = (studentId: string, status: AttendanceStatus) => {
-    const todayRecord = attendance[currentDate] || {};
+    const activeKey = `${currentDate}__${selectedPeriod}`;
+    const todayRecord = attendance[activeKey] || {};
     const currentStudentRec = todayRecord[studentId] || { status: '', observation: '', tags: [] };
     saveAttendanceStateOptimistic(studentId, status, currentStudentRec.observation, currentStudentRec.tags);
   };
 
   // --- OBSERVATION TEXT UPDATE ---
   const handleObservationChange = (studentId: string, text: string) => {
-    const todayRecord = attendance[currentDate] || {};
+    const activeKey = `${currentDate}__${selectedPeriod}`;
+    const todayRecord = attendance[activeKey] || {};
     const currentStudentRec = todayRecord[studentId] || { status: '', observation: '', tags: [] };
     saveAttendanceStateOptimistic(studentId, currentStudentRec.status, text, currentStudentRec.tags);
   };
 
   // --- TAG PILLS SELECTION ---
   const togglePresetTag = (studentId: string, tag: PresetTag) => {
-    const todayRecord = attendance[currentDate] || {};
+    const activeKey = `${currentDate}__${selectedPeriod}`;
+    const todayRecord = attendance[activeKey] || {};
     const currentStudentRec = todayRecord[studentId] || { status: '', observation: '', tags: [] };
     
     const exists = currentStudentRec.tags.includes(tag);
@@ -388,29 +450,64 @@ export default function App() {
 
   // --- MASS ASISTENCIA REGISTRATION (RESPETS R, L, F) ---
   const handleMassAttendance = async () => {
-    let updatedCount = 0;
+    const activeKey = `${currentDate}__${selectedPeriod}`;
     const courseStudents = students.filter(st => st.course === selectedCourse);
-    const promises = courseStudents.map(async (st) => {
-      const todayRecord = attendance[currentDate] || {};
-      const studentRec = todayRecord[st.id] || { status: '', observation: '', tags: [] };
-      if (studentRec.status === '') {
-        const docId = `${currentDate}__${st.id}`;
-        updatedCount++;
-        return setDoc(doc(db, 'attendance', docId), {
+    const todayRecord = attendance[activeKey] || {};
+    
+    // Find who needs to be updated (those that currently have an empty status)
+    const studentsToUpdate = courseStudents.filter(st => {
+      const rec = todayRecord[st.id] || { status: '', observation: '', tags: [] };
+      return rec.status === '';
+    });
+
+    const updatedCount = studentsToUpdate.length;
+
+    if (updatedCount === 0) {
+      showToast(`Todos los estudiantes de ${selectedCourse} ya están registrados para esta fecha y periodo (${selectedPeriod}).`, 'info');
+      return;
+    }
+
+    // 1. Optimistic Update of local state immediately to make it react instantly
+    setAttendance(prev => {
+      const currentTodayRec = { ...(prev[activeKey] || {}) };
+      studentsToUpdate.forEach(st => {
+        const existingRec = currentTodayRec[st.id] || { status: '', observation: '', tags: [] };
+        currentTodayRec[st.id] = {
+          ...existingRec,
+          status: 'A'
+        };
+      });
+      return {
+        ...prev,
+        [activeKey]: currentTodayRec
+      };
+    });
+
+    showToast(`Registrando masivamente ${updatedCount} alumnos con Asistencia...`, 'info');
+
+    // 2. Perform Firestore writes in the background
+    const promises = studentsToUpdate.map(async (st) => {
+      const existingRec = todayRecord[st.id] || { status: '', observation: '', tags: [] };
+      const docId = `${currentDate}__${selectedPeriod}__${st.id}`;
+      try {
+        await setDoc(doc(db, 'attendance', docId), {
           id: docId,
           date: currentDate,
+          period: selectedPeriod,
           studentId: st.id,
           status: 'A',
-          observation: studentRec.observation,
-          tags: studentRec.tags,
+          observation: existingRec.observation || '',
+          tags: existingRec.tags || [],
           updatedAt: new Date().toISOString()
         });
+      } catch (error) {
+        console.error(`Error saving mass attendance for student ${st.id}:`, error);
       }
     });
 
     try {
       await Promise.all(promises);
-      showToast(`Control Masivo Completado: ${updatedCount} estudiantes de ${selectedCourse} marcados con Asistencia 'A'.`, 'success');
+      showToast(`Control Masivo Completado: ${updatedCount} estudiantes marcados con Asistencia 'A' para el periodo ${selectedPeriod}.`, 'success');
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, `attendance/mass`);
     }
@@ -451,7 +548,8 @@ export default function App() {
     recognition.onresult = (event: any) => {
       const transcript = event.results[0][0].transcript;
       if (transcript) {
-        const todayRecord = attendance[currentDate] || {};
+        const activeKey = `${currentDate}__${selectedPeriod}`;
+        const todayRecord = attendance[activeKey] || {};
         const currentStudentRec = todayRecord[studentId] || { status: '', observation: '', tags: [] };
         const separator = currentStudentRec.observation ? ' ' : '';
         const newText = currentStudentRec.observation + separator + transcript;
@@ -521,20 +619,27 @@ export default function App() {
     setSeedProgress(1);
 
     try {
+      const batchList: Student[][] = [];
+      const size = 200; // split into chunks of 200 to show progressive bar state updates
+      for (let i = 0; i < DEFAULT_STUDENTS.length; i += size) {
+        batchList.push(DEFAULT_STUDENTS.slice(i, i + size));
+      }
+
       let count = 0;
-      for (let i = 0; i < DEFAULT_STUDENTS.length; i++) {
-        const st = DEFAULT_STUDENTS[i];
-        await setDoc(doc(db, 'students', st.id), {
-          id: st.id,
-          name: st.name,
-          surname: st.surname,
-          course: st.course,
-          createdAt: new Date().toISOString()
+      for (let b = 0; b < batchList.length; b++) {
+        const batch = writeBatch(db);
+        batchList[b].forEach((st) => {
+          batch.set(doc(db, 'students', st.id), {
+            id: st.id,
+            name: st.name,
+            surname: st.surname,
+            course: st.course,
+            createdAt: new Date().toISOString()
+          });
+          count++;
         });
-        count++;
-        if (count % 35 === 0 || count === DEFAULT_STUDENTS.length) {
-          setSeedProgress(Math.round((count / DEFAULT_STUDENTS.length) * 100));
-        }
+        await batch.commit();
+        setSeedProgress(Math.round((count / DEFAULT_STUDENTS.length) * 100));
       }
       showToast(`¡Sincronización Exitosa! ${count} estudiantes cargados en los 18 cursos de Secundaria para la Gestión 2026.`, 'success');
     } catch (error) {
@@ -561,17 +666,31 @@ export default function App() {
   // --- COMPUTE STATISTICS FOR DATE RANGE ---
   const getDatesInRange = (startStr: string, endStr: string) => {
     const dates: string[] = [];
-    let current = new Date(startStr);
-    const end = new Date(endStr);
+    if (!startStr || !endStr) return dates;
+    
+    const startParts = startStr.split('-');
+    const endParts = endStr.split('-');
+    if (startParts.length !== 3 || endParts.length !== 3) return dates;
+    
+    const current = new Date(Date.UTC(
+      parseInt(startParts[0], 10),
+      parseInt(startParts[1], 10) - 1,
+      parseInt(startParts[2], 10)
+    ));
+    const end = new Date(Date.UTC(
+      parseInt(endParts[0], 10),
+      parseInt(endParts[1], 10) - 1,
+      parseInt(endParts[2], 10)
+    ));
     
     // Safety check to prevent infinite loops if dates are invalid
     let maxSteps = 400; // limit report to ~1 year
     while (current <= end && maxSteps > 0) {
-      const year = current.getFullYear();
-      const month = String(current.getMonth() + 1).padStart(2, '0');
-      const day = String(current.getDate()).padStart(2, '0');
+      const year = current.getUTCFullYear();
+      const month = String(current.getUTCMonth() + 1).padStart(2, '0');
+      const day = String(current.getUTCDate()).padStart(2, '0');
       dates.push(`${year}-${month}-${day}`);
-      current.setDate(current.getDate() + 1);
+      current.setUTCDate(current.getUTCDate() + 1);
       maxSteps--;
     }
     return dates;
@@ -584,24 +703,48 @@ export default function App() {
     const obsList: { date: string; text: string; tags: string[] }[] = [];
 
     reportDates.forEach(d => {
-      const dayRec = attendance[d]?.[studentId];
-      if (dayRec) {
-        if (dayRec.status === 'A') A++;
-        else if (dayRec.status === 'R') R++;
-        else if (dayRec.status === 'L') L++;
-        else if (dayRec.status === 'F') F++;
-        else unchecked++;
+      if (reportPeriodFilter === 'Todos') {
+        ['P1', 'P2', 'P3', 'P4'].forEach(p => {
+          const key = `${d}__${p}`;
+          const dayRec = attendance[key]?.[studentId];
+          if (dayRec) {
+            if (dayRec.status === 'A') A++;
+            else if (dayRec.status === 'R') R++;
+            else if (dayRec.status === 'L') L++;
+            else if (dayRec.status === 'F') F++;
+            else unchecked++;
 
-        // Save observations if any exist on this day
-        if (dayRec.observation.trim() || dayRec.tags.length > 0) {
-          obsList.push({
-            date: d,
-            text: dayRec.observation,
-            tags: dayRec.tags
-          });
-        }
+            if (dayRec.observation.trim() || dayRec.tags.length > 0) {
+              obsList.push({
+                date: `${d} (${p})`,
+                text: dayRec.observation.trim(),
+                tags: dayRec.tags
+              });
+            }
+          } else {
+            unchecked++;
+          }
+        });
       } else {
-        unchecked++;
+        const key = `${d}__${reportPeriodFilter}`;
+        const dayRec = attendance[key]?.[studentId];
+        if (dayRec) {
+          if (dayRec.status === 'A') A++;
+          else if (dayRec.status === 'R') R++;
+          else if (dayRec.status === 'L') L++;
+          else if (dayRec.status === 'F') F++;
+          else unchecked++;
+
+          if (dayRec.observation.trim() || dayRec.tags.length > 0) {
+            obsList.push({
+              date: d,
+              text: dayRec.observation.trim(),
+              tags: dayRec.tags
+            });
+          }
+        } else {
+          unchecked++;
+        }
       }
     });
 
@@ -662,7 +805,8 @@ export default function App() {
       doc.setFontSize(10);
       doc.setTextColor(71, 85, 105); // slate 600
       doc.text('Registro Oficial de Control Escolar de Asistencia - Nivel Secundario', 105, 21, { align: 'center' });
-      doc.text(`Gestión Escolar 2026 | Rango: ${reportStartDate} al ${reportEndDate} | Curso: ${reportCourseFilter}`, 105, 26, { align: 'center' });
+      const periodLabel = reportPeriodFilter === 'Todos' ? 'Todos los Periodos (Combinado)' : reportPeriodFilter;
+      doc.text(`Gestión Escolar 2026 | Rango: ${reportStartDate} al ${reportEndDate} | Curso: ${reportCourseFilter} | Periodo: ${periodLabel}`, 105, 26, { align: 'center' });
       
       // Divider line
       doc.setDrawColor(30, 41, 59); // slate 800
@@ -931,7 +1075,8 @@ export default function App() {
     );
   }
 
-  // --- STATS CALCULATION FOR CURRENT COURSE AND SELECTED DATE ---
+  // --- STATS CALCULATION FOR CURRENT COURSE AND SELECTED DATE & PERIOD ---
+  const activeKey = `${currentDate}__${selectedPeriod}`;
   const courseStudents = students.filter(st => st.course === selectedCourse);
   let countA = 0;
   let countR = 0;
@@ -940,7 +1085,7 @@ export default function App() {
   let countSinRegistrar = 0;
 
   courseStudents.forEach(st => {
-    const status = attendance[currentDate]?.[st.id]?.status || '';
+    const status = attendance[activeKey]?.[st.id]?.status || '';
     if (status === 'A') countA++;
     else if (status === 'R') countR++;
     else if (status === 'L') countL++;
@@ -996,6 +1141,16 @@ export default function App() {
                   <span className="font-mono text-slate-300">Gestión Escolar 2026</span>
                   <span>•</span>
                   <span className="bg-slate-800 px-2.5 py-0.5 rounded text-[10px] text-slate-300 uppercase tracking-widest border border-slate-700">Bolivia</span>
+                </div>
+                {/* INDICADOR DE TIEMPO REAL COOPERATIVO */}
+                <div className="mt-2 flex items-center gap-1.5 bg-slate-850 px-2.5 py-1 rounded-lg border border-emerald-500/25 w-fit">
+                  <span className="relative flex h-2 w-2 shrink-0">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                  </span>
+                  <span className="text-[9.5px] font-bold text-emerald-400 tracking-wider font-mono uppercase">
+                    Base de Datos en Tiempo Real Sincronizada (Modo Cooperativo Activo)
+                  </span>
                 </div>
               </div>
             </div>
@@ -1086,7 +1241,13 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="font-extrabold text-slate-900 text-xs uppercase tracking-wide">CURSO SECUNDARIA SELECCIONADO</h3>
-                    <p className="text-[10px] text-slate-400 mt-0.5">Seleccione el curso de secundaria para el control de asistencia diario</p>
+                    <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
+                      <p className="text-[10px] text-slate-400">Seleccione el curso de secundaria para el control de asistencia diario</p>
+                      <span className="h-0.5 w-0.5 rounded-full bg-slate-300"></span>
+                      <span className="text-[9.5px] font-extrabold text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100">
+                        Total Alumnos (Sistema): {students.length}
+                      </span>
+                    </div>
                   </div>
                 </div>
 
@@ -1117,11 +1278,53 @@ export default function App() {
               </div>
             </div>
 
+            {/* COMPOSITE PERIOD SELECTOR FOR ATTENDANCE (P1, P2, P3, P4) */}
+            <div className="bg-slate-900 rounded-2xl border border-slate-950 p-4 sm:p-5 shadow-lg relative overflow-hidden">
+              <div className="absolute top-0 right-0 h-40 w-40 bg-yellow-400/5 rounded-full blur-2xl pointer-events-none"></div>
+              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="bg-slate-800 p-2.5 rounded-xl text-yellow-400 border border-slate-700/50">
+                    <Clock className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-extrabold text-white text-xs uppercase tracking-wider">PERIODO DE CONTROL EN CURSO</h3>
+                    <p className="text-[10px] text-slate-400 mt-0.5">Seleccione el periodo (P1, P2, P3 o P4) asignado a su materia para el control de asistencia</p>
+                  </div>
+                </div>
+
+                {/* The periods (P1, P2, P3, P4) button segments */}
+                <div className="grid grid-cols-4 bg-slate-800 p-1.5 rounded-xl border border-slate-700 w-full md:w-auto md:min-w-[400px]">
+                  {['P1', 'P2', 'P3', 'P4'].map((p) => {
+                    const label = p === 'P1' ? '1er Periodo' : p === 'P2' ? '2do Periodo' : p === 'P3' ? '3er Periodo' : '4to Periodo';
+                    const isActive = selectedPeriod === p;
+                    return (
+                      <button
+                        key={p}
+                        id={`btn-period-select-${p}`}
+                        onClick={() => {
+                          setSelectedPeriod(p);
+                          showToast(`Cambiado al ${label} (${p}) con éxito`, 'info');
+                        }}
+                        className={`py-2 px-1 rounded-lg text-xs font-black tracking-wide transition-all uppercase text-all text-center flex flex-col items-center justify-center cursor-pointer ${
+                          isActive
+                            ? 'bg-yellow-400 text-slate-950 font-black shadow-md shadow-yellow-400/25'
+                            : 'text-slate-400 hover:text-white hover:bg-slate-700/50'
+                        }`}
+                      >
+                        <span className="text-sm font-mono font-black">{p}</span>
+                        <span className="text-[8px] font-bold opacity-90 mt-0.5 hidden sm:inline">{label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
             {/* CONTROL PANEL CARD */}
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-5">
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
               
               {/* Left hand side: Date adjusters */}
-              <div className="flex flex-col sm:flex-row sm:items-center gap-3.5">
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3.5 w-full sm:w-auto">
                 <div className="bg-slate-100 p-2.5 rounded-xl shrink-0 text-slate-800 font-bold text-xs uppercase flex items-center gap-2">
                   <Calendar className="h-4.5 w-4.5 text-slate-600" />
                   <span>REGISTRO DE FECHA</span>
@@ -1130,7 +1333,7 @@ export default function App() {
                 <div className="flex items-center gap-1.5">
                   <button
                     onClick={() => handleShiftDate(-1)}
-                    className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 text-slate-600 transition"
+                    className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 text-slate-600 transition cursor-pointer"
                     title="Día Anterior"
                   >
                     <ChevronLeft className="h-4 w-4" />
@@ -1146,7 +1349,7 @@ export default function App() {
 
                   <button
                     onClick={() => handleShiftDate(1)}
-                    className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 text-slate-600 transition"
+                    className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 text-slate-600 transition cursor-pointer"
                     title="Día Siguiente"
                   >
                     <ChevronRight className="h-4 w-4" />
@@ -1154,64 +1357,66 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Center right: Bulk assistance option */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 flex flex-all flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="max-w-md">
-                  <span className="text-xs font-bold text-slate-800 block uppercase">Control Masivo de Asistencia ({selectedCourse})</span>
-                  <span className="text-[10.5px] text-slate-500 leading-tight block mt-0.5">
-                    Rellena todos los sin registrar como <span className="font-bold text-emerald-600">A (Asistencia)</span>, respetando estrictamente a quienes ya tengan un Retraso (R), Licencia (L) o Falta (F).
-                  </span>
-                </div>
-                <button
-                  id="btn-bulk-attendance"
-                  onClick={handleMassAttendance}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg px-4.5 py-2.5 text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer select-none border-b-2 border-emerald-800"
-                >
-                  <CheckCircle className="h-4.5 w-4.5" />
-                  <span>Registrar Masivo</span>
-                </button>
+              {/* Informative Label on Right */}
+              <div className="hidden md:flex items-center gap-2 text-slate-400 text-xs">
+                <span className="font-mono text-[10.5px]">Control activo: {selectedCourse} • {selectedPeriod}</span>
               </div>
 
             </div>
 
-            {/* REAL-TIME STATS ROW (CURSO SELECCIONADO) */}
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 sm:p-5 space-y-3">
-              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-slate-100 pb-2.5">
-                <div className="flex items-center gap-2 text-slate-755">
-                  <span className="text-[10px] font-extrabold uppercase tracking-wider font-mono text-slate-500">RESUMEN DE ASISTENCIA</span>
+            {/* COMPACT REAL-TIME STATS ROW */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5 sm:p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              
+              {/* Left group: Flowing compact stat badges */}
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-[10px] font-black uppercase tracking-wider font-mono text-slate-400 mr-1.5">Resumen:</span>
+                
+                <div className="bg-slate-105 text-slate-800 px-2.5 py-1.5 rounded-xl font-bold flex items-center gap-1 bg-slate-100">
+                  <span className="text-[9px] font-bold text-slate-500 uppercase">Matrícula:</span>
+                  <span className="font-mono font-black text-xs">{courseStudents.length}</span>
                 </div>
-                <div className="text-xs text-slate-600 bg-slate-100 px-3.5 py-1.5 rounded-xl font-bold flex items-center gap-2">
-                  <span className="h-2 w-2 rounded-full bg-slate-400 animate-pulse"></span>
-                  <span>Total Estudiantes Registrados: <span className="text-slate-900 font-black font-mono text-sm">{courseStudents.length}</span></span>
+                
+                <div className="bg-emerald-50 text-emerald-850 px-2.5 py-1.5 rounded-xl font-bold flex items-center gap-1 border border-emerald-100">
+                  <span className="text-[9px] font-bold text-emerald-600 uppercase">A:</span>
+                  <span className="font-mono font-black text-xs text-emerald-700">{countA}</span>
+                </div>
+
+                <div className="bg-amber-50 text-amber-850 px-2.5 py-1.5 rounded-xl font-bold flex items-center gap-1 border border-amber-100">
+                  <span className="text-[9px] font-bold text-amber-600 uppercase">R:</span>
+                  <span className="font-mono font-black text-xs text-amber-700">{countR}</span>
+                </div>
+
+                <div className="bg-sky-50 text-sky-850 px-2.5 py-1.5 rounded-xl font-bold flex items-center gap-1 border border-sky-100">
+                  <span className="text-[9px] font-bold text-sky-600 uppercase">L:</span>
+                  <span className="font-mono font-black text-xs text-sky-700">{countL}</span>
+                </div>
+
+                <div className="bg-rose-50 text-rose-850 px-2.5 py-1.5 rounded-xl font-bold flex items-center gap-1 border border-rose-100">
+                  <span className="text-[9px] font-bold text-rose-600 uppercase">F:</span>
+                  <span className="font-mono font-black text-xs text-rose-700">{countF}</span>
+                </div>
+
+                <div className="bg-slate-50 text-slate-600 px-2.5 py-1.5 rounded-xl font-bold flex items-center gap-1 border border-slate-150">
+                  <span className="text-[9px] font-bold text-slate-400 uppercase">Sin Reg:</span>
+                  <span className="font-mono font-black text-xs">{countSinRegistrar}</span>
                 </div>
               </div>
 
-              {/* REAL-TIME STATS SHELF FOR SELECTED COURSE ON CURRENT DATE */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 sm:p-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-                <div className="bg-white border border-slate-150 rounded-lg p-3 shadow-xs flex flex-col justify-center">
-                  <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Asistencia (A)</span>
-                  <span className="text-xl font-bold text-emerald-600 font-mono mt-0.5">{countA} <span className="text-xs text-slate-400 font-normal">est.</span></span>
+              {/* Right group: Sum of real assistants (A+R) and Bulk Action right alongside */}
+              <div className="flex flex-wrap items-center gap-3 w-full lg:w-auto justify-between lg:justify-end shrink-0">
+                <div className="bg-slate-900 border border-slate-950 rounded-xl px-3.5 py-1.5 flex flex-col items-center justify-center min-w-[130px] shadow-sm">
+                  <span className="text-[8.5px] font-extrabold text-amber-400 uppercase tracking-widest">ASISTENTES (A+R)</span>
+                  <span className="text-sm font-black text-white font-mono leading-none mt-1">{totalAsistentesReal} <span className="text-[9px] font-normal text-slate-300">alumnos</span></span>
                 </div>
-                <div className="bg-white border border-slate-150 rounded-lg p-3 shadow-xs flex flex-col justify-center">
-                  <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Retrasos (R)</span>
-                  <span className="text-xl font-bold text-amber-500 font-mono mt-0.5">{countR} <span className="text-xs text-slate-400 font-normal">est.</span></span>
-                </div>
-                <div className="bg-white border border-slate-150 rounded-lg p-3 shadow-xs flex flex-col justify-center">
-                  <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Licencias (L)</span>
-                  <span className="text-xl font-bold text-sky-500 font-mono mt-0.5">{countL} <span className="text-xs text-slate-400 font-normal">est.</span></span>
-                </div>
-                <div className="bg-white border border-slate-150 rounded-lg p-3 shadow-xs flex flex-col justify-center">
-                  <span className="text-[10px] font-extrabold text-slate-500 uppercase tracking-wider">Faltas (F)</span>
-                  <span className="text-xl font-bold text-rose-500 font-mono mt-0.5">{countF} <span className="text-xs text-slate-400 font-normal">est.</span></span>
-                </div>
-                <div className="bg-white border border-slate-150 rounded-lg p-3 shadow-xs flex flex-col justify-center">
-                  <span className="text-[10px] font-extrabold text-slate-505 uppercase tracking-wider">Sin Registrar</span>
-                  <span className="text-xl font-bold text-slate-400 font-mono mt-0.5">{countSinRegistrar} <span className="text-xs text-slate-400 font-normal">est.</span></span>
-                </div>
-                <div className="bg-slate-900 border border-slate-950 rounded-lg p-3 shadow-xs flex flex-col justify-center">
-                  <span className="text-[10.5px] font-black text-amber-400 uppercase tracking-wider">TOTAL ASISTENTES (A+R)</span>
-                  <span className="text-2xl font-black text-white font-mono mt-0.5">{totalAsistentesReal} <span className="text-xs text-slate-300 font-medium">alumnos</span></span>
-                </div>
+
+                <button
+                  id="btn-bulk-attendance"
+                  onClick={handleMassAttendance}
+                  className="bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white rounded-xl px-4 py-2 text-xs font-black transition-all flex items-center gap-1.5 shadow-md shadow-emerald-500/10 hover:scale-[1.01] border-b-2 border-emerald-800 cursor-pointer select-none"
+                >
+                  <CheckCircle className="h-4 w-4 shrink-0 text-white" />
+                  <span>Registrar Masivo</span>
+                </button>
               </div>
 
             </div>
@@ -1228,34 +1433,36 @@ export default function App() {
                 </div>
               ) : (
                 students.filter(st => st.course === selectedCourse).map((student, index) => {
-                  const studentAttendance = attendance[currentDate]?.[student.id] || { status: '', observation: '', tags: [] };
+                  const studentAttendance = attendance[activeKey]?.[student.id] || { status: '', observation: '', tags: [] };
                   const isListening = listeningStudentId === student.id;
 
                   return (
                     <div 
                       key={student.id} 
-                      className="bg-white rounded-2xl border border-slate-200 hover:border-slate-300 p-4 shadow-xs transition-all flex flex-col md:flex-row md:items-center justify-between gap-4"
+                      className="bg-white rounded-2xl border border-slate-200 hover:border-slate-300 p-3.5 sm:p-4 shadow-xs transition-all flex flex-col gap-3.5"
                     >
-                      {/* Left Block: Index, student name */}
-                      <div className="flex items-center gap-4 min-w-[280px]">
-                        <span className="h-7 w-7 rounded-lg bg-slate-100 text-slate-500 font-mono text-center flex items-center justify-center text-xs font-bold">
-                          {String(index + 1).padStart(2, '0')}
-                        </span>
-                        <div>
-                          <h4 className="font-bold text-slate-900 group-hover:text-amber-600 text-[14.5px]">
-                            {student.surname}
-                          </h4>
-                          <p className="text-xs font-semibold text-slate-400">{student.name}</p>
+                      {/* Top line on mobile: holds student name + index AND the cycle bubble side-by-side! on md/lg, sits as flex row items-center */}
+                      <div className="flex flex-row items-center justify-between md:justify-start gap-4 w-full">
+                        
+                        {/* Left Block: Index, student name */}
+                        <div className="flex items-center gap-3 min-w-0 flex-1 md:flex-initial md:min-w-[280px]">
+                          <span className="h-7 w-7 rounded-lg bg-slate-100 text-slate-500 font-mono text-center flex items-center justify-center text-xs font-bold shrink-0">
+                            {String(index + 1).padStart(2, '0')}
+                          </span>
+                          <div className="min-w-0 truncate">
+                            <h4 className="font-bold text-slate-900 leading-tight text-[14px] truncate">
+                              {student.surname}
+                            </h4>
+                            <p className="text-xs font-semibold text-slate-400 truncate">{student.name}</p>
+                          </div>
                         </div>
-                      </div>
 
-                      {/* Middle Block: UNIFIED STATE BUBBLE INTERFACE (Tap to Cycle) */}
-                      <div className="flex items-center gap-3 shrink-0">
-                        <div className="flex flex-col items-center gap-1">
+                        {/* Middle Block: UNIFIED STATE BUBBLE INTERFACE (Tap to Cycle) */}
+                        <div className="flex items-center gap-3 shrink-0">
                           <button
                             type="button"
                             onClick={() => cycleAttendance(student.id)}
-                            className={`h-12 w-12 sm:h-14 sm:w-14 rounded-full font-black text-sm sm:text-base flex items-center justify-center transition-all transform hover:scale-110 active:scale-95 cursor-pointer shadow-sm select-none border-2 border-transparent ${
+                            className={`h-11 w-11 sm:h-12 sm:w-12 rounded-full font-black text-xs sm:text-sm flex items-center justify-center transition-all transform hover:scale-[1.05] active:scale-95 cursor-pointer shadow-sm select-none border-2 border-transparent shrink-0 ${
                               studentAttendance.status === 'A'
                                 ? 'bg-emerald-500 text-white shadow-md shadow-emerald-500/35 ring-2 ring-emerald-600'
                                 : studentAttendance.status === 'R'
@@ -1266,24 +1473,35 @@ export default function App() {
                                 ? 'bg-rose-500 text-white shadow-md shadow-rose-500/35 ring-2 ring-rose-600'
                                 : 'bg-white border-2 border-dashed border-slate-300 text-slate-400 hover:border-slate-400 hover:bg-slate-50'
                             }`}
-                            title="Tocar para alternar: Sin marcar -> A -> R -> L -> F"
+                            title="Tocar para alternar"
                           >
                             {studentAttendance.status || '•'}
                           </button>
+                          
+                          <div className="hidden lg:flex flex-col text-[10px] text-slate-400 leading-tight shrink-0">
+                            <span className={`${studentAttendance.status === 'A' ? 'text-emerald-600 font-bold' : ''}`}>A: Asistencia</span>
+                            <span className={`${studentAttendance.status === 'R' ? 'text-amber-550 font-bold' : ''}`}>R: Retraso</span>
+                            <span className={`${studentAttendance.status === 'L' ? 'text-sky-600 font-bold' : ''}`}>L: Licencia</span>
+                            <span className={`${studentAttendance.status === 'F' ? 'text-rose-600 font-bold' : ''}`}>F: Falta</span>
+                          </div>
                         </div>
-                        
-                        <div className="hidden lg:flex flex-col text-[10px] text-slate-400 leading-tight">
-                          <span className={`${studentAttendance.status === 'A' ? 'text-emerald-600 font-bold' : ''}`}>A: Asistencia</span>
-                          <span className={`${studentAttendance.status === 'R' ? 'text-amber-550 font-bold' : ''}`}>R: Retraso</span>
-                          <span className={`${studentAttendance.status === 'L' ? 'text-sky-600 font-bold' : ''}`}>L: Licencia</span>
-                          <span className={`${studentAttendance.status === 'F' ? 'text-rose-600 font-bold' : ''}`}>F: Falta</span>
+
+                        {/* Desktop-only separator & right observation block */}
+                        <div className="hidden md:block h-8 w-px bg-slate-250 shrink-0"></div>
+                        <div className="hidden md:block flex-1">
+                          <StudentObservationInput 
+                            studentId={student.id}
+                            value={studentAttendance.observation}
+                            onSave={handleObservationChange}
+                            isListening={isListening}
+                            onVoiceToggle={() => handleVoiceToggle(student.id)}
+                          />
                         </div>
+
                       </div>
 
-                      {/* Right Block: DETAILED OBSERVATIONS & SPEECH & PRESETS */}
-                      <div className="flex-1 space-y-2.5">
-                        
-                        {/* Text input row using our enhanced local observer input */}
+                      {/* Mobile-only observation block at the bottom */}
+                      <div className="block md:hidden w-full">
                         <StudentObservationInput 
                           studentId={student.id}
                           value={studentAttendance.observation}
@@ -1291,16 +1509,6 @@ export default function App() {
                           isListening={isListening}
                           onVoiceToggle={() => handleVoiceToggle(student.id)}
                         />
-
-                        {/* PRESETS DROP BUBBLE FOR REQUIRED CRITERIA */}
-                        <div className="flex flex-wrap items-center gap-2 pt-1">
-                          <span className="text-[10px] font-bold text-slate-400 uppercase">Observación Rápida:</span>
-                          <StudentPresetDropdown 
-                            selectedTags={studentAttendance.tags}
-                            onToggleTag={(tag) => togglePresetTag(student.id, tag)}
-                          />
-                        </div>
-
                       </div>
                     </div>
                   );
@@ -1524,7 +1732,7 @@ export default function App() {
               </div>
 
               {/* inputs flex rows */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
                 
                 <div className="space-y-1">
                   <label htmlFor="report-start" className="text-[10px] font-bold text-slate-500 uppercase">Fecha de Inicio del Reporte</label>
@@ -1560,6 +1768,22 @@ export default function App() {
                     {COURSES.map(course => (
                       <option key={course} value={course}>{course}</option>
                     ))}
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label htmlFor="report-period-filter" className="text-[10px] font-bold text-slate-500 uppercase">Filtrar por Periodo</label>
+                  <select
+                    id="report-period-filter"
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-bold text-slate-800 focus:bg-white focus:outline-none focus:ring-1 focus:ring-slate-800"
+                    value={reportPeriodFilter}
+                    onChange={(e) => setReportPeriodFilter(e.target.value)}
+                  >
+                    <option value="Todos">Todos (P1+P2+P3+P4)</option>
+                    <option value="P1">P1 (Primer Periodo)</option>
+                    <option value="P2">P2 (Segundo Periodo)</option>
+                    <option value="P3">P3 (Tercer Periodo)</option>
+                    <option value="P4">P4 (Cuarto Periodo)</option>
                   </select>
                 </div>
 
