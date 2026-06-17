@@ -1,0 +1,10 @@
+{
+  "name": "Control de Asistencia - Santo Domingo Savio",
+  "description": "Sistema de registro y control de asistencia escolar para la Unidad Educativa Santo Domingo Savio, Nivel Secundario, Gestión 2026.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
